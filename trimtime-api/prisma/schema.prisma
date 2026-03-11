@@ -1,0 +1,328 @@
+// ============================================================
+// TrimTime — Prisma Schema
+// Database: PostgreSQL
+// ORM: Prisma v5
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+
+enum UserRole {
+  customer
+  salon_owner
+  staff
+  admin
+}
+
+enum SalonStatus {
+  pending    // Newly registered, awaiting platform admin approval
+  active     // Fully operational
+  suspended  // Disabled by admin
+}
+
+enum SubscriptionTier {
+  free
+  pro
+  enterprise
+}
+
+enum BookingStatus {
+  pending      // Created, awaiting staff confirmation
+  confirmed    // Confirmed by salon
+  in_progress  // Customer is currently being served
+  completed    // Service finished
+  cancelled    // Cancelled by customer or staff
+  no_show      // Customer did not arrive
+}
+
+enum BookingType {
+  appointment  // Pre-scheduled appointment
+  walk_in      // Walk-in added by staff
+  queue        // Joined the live queue
+}
+
+enum DayOfWeek {
+  SUNDAY    // 0
+  MONDAY    // 1
+  TUESDAY   // 2
+  WEDNESDAY // 3
+  THURSDAY  // 4
+  FRIDAY    // 5
+  SATURDAY  // 6
+}
+
+// ============================================================
+// USERS & AUTHENTICATION
+// ============================================================
+
+model User {
+  id        String   @id @default(uuid()) @db.Uuid
+  phone     String   @unique @db.VarChar(20)
+  name      String?  @db.VarChar(100)
+  role      UserRole @default(customer)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  ownedSalons Salon[]   @relation("SalonOwner")
+  barbers     Barber[]  @relation("BarberUser")
+  bookings    Booking[] @relation("CustomerBookings")
+
+  @@index([phone])
+  @@index([role])
+  @@map("users")
+}
+
+model OtpCode {
+  id        String   @id @default(uuid()) @db.Uuid
+  phone     String   @db.VarChar(20)
+  code      String   @db.VarChar(6)
+  expiresAt DateTime @map("expires_at")
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([phone, expiresAt])  // Fast lookup for verify endpoint
+  @@index([expiresAt])         // Efficient cleanup of expired codes
+  @@map("otp_codes")
+}
+
+// ============================================================
+// SUBSCRIPTIONS
+// ============================================================
+
+model SubscriptionPlan {
+  id           String           @id @default(uuid()) @db.Uuid
+  name         SubscriptionTier @unique
+  priceMonthly Decimal?         @map("price_monthly") @db.Decimal(10, 2)
+  maxBarbers   Int?             @map("max_barbers")
+  maxBookings  Int?             @map("max_bookings") // per month, null = unlimited
+  features     Json             @default("[]")       // string[] of feature keys
+  createdAt    DateTime         @default(now()) @map("created_at")
+  updatedAt    DateTime         @updatedAt @map("updated_at")
+
+  // Relations
+  salons Salon[]
+
+  @@map("subscription_plans")
+}
+
+// ============================================================
+// SALONS
+// ============================================================
+
+model Salon {
+  id           String           @id @default(uuid()) @db.Uuid
+  ownerId      String?          @map("owner_id") @db.Uuid
+  planId       String?          @map("plan_id") @db.Uuid
+  slug         String           @unique @db.VarChar(100) // URL-safe, e.g. "raj-barbers"
+  name         String           @db.VarChar(150)
+  phone        String?          @db.VarChar(20)
+  address      String?          @db.Text
+  mapsUrl      String?          @map("maps_url") @db.Text
+  latitude     Decimal?         @db.Decimal(9, 6)
+  longitude    Decimal?         @db.Decimal(9, 6)
+  coverImage   String?          @map("cover_image") @db.Text // S3 URL
+  logoImage    String?          @map("logo_image") @db.Text  // S3 URL
+  status       SalonStatus      @default(pending)
+  subscription SubscriptionTier @default(free)
+  createdAt    DateTime         @default(now()) @map("created_at")
+  updatedAt    DateTime         @updatedAt @map("updated_at")
+
+  // Relations
+  owner        User?              @relation("SalonOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  plan         SubscriptionPlan?  @relation(fields: [planId], references: [id], onDelete: SetNull)
+  photos       SalonPhoto[]
+  openingHours OpeningHours[]
+  services     Service[]
+  barbers      Barber[]
+  bookings     Booking[]
+  queueEntries QueueEntry[]
+
+  @@index([slug])
+  @@index([status])
+  @@index([ownerId])
+  @@map("salons")
+}
+
+model SalonPhoto {
+  id        String   @id @default(uuid()) @db.Uuid
+  salonId   String   @map("salon_id") @db.Uuid
+  url       String   @db.Text
+  altText   String?  @map("alt_text") @db.VarChar(255)
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  salon Salon @relation(fields: [salonId], references: [id], onDelete: Cascade)
+
+  @@index([salonId, sortOrder])
+  @@map("salon_photos")
+}
+
+model OpeningHours {
+  id          String     @id @default(uuid()) @db.Uuid
+  salonId     String     @map("salon_id") @db.Uuid
+  dayOfWeek   DayOfWeek  @map("day_of_week")
+  openTime    String?    @map("open_time") @db.VarChar(8)  // "09:00:00"
+  closeTime   String?    @map("close_time") @db.VarChar(8) // "18:00:00"
+  isOpen      Boolean    @default(true) @map("is_open")
+
+  // Relations
+  salon Salon @relation(fields: [salonId], references: [id], onDelete: Cascade)
+
+  @@unique([salonId, dayOfWeek]) // One record per day per salon
+  @@index([salonId])
+  @@map("opening_hours")
+}
+
+// ============================================================
+// SERVICES
+// ============================================================
+
+model Service {
+  id            String   @id @default(uuid()) @db.Uuid
+  salonId       String   @map("salon_id") @db.Uuid
+  name          String   @db.VarChar(150)
+  description   String?  @db.Text
+  price         Decimal  @db.Decimal(10, 2)
+  durationMins  Int      @map("duration_mins")  // Used for scheduling + wait time calculations
+  icon          String?  @db.VarChar(50)         // Material Symbol icon name
+  isActive      Boolean  @default(true) @map("is_active")
+  sortOrder     Int      @default(0) @map("sort_order")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  salon          Salon           @relation(fields: [salonId], references: [id], onDelete: Cascade)
+  barberServices BarberService[]
+  bookings       Booking[]
+
+  @@index([salonId, isActive])
+  @@index([salonId, sortOrder])
+  @@map("services")
+}
+
+// ============================================================
+// BARBERS / STAFF
+// ============================================================
+
+model Barber {
+  id        String   @id @default(uuid()) @db.Uuid
+  salonId   String   @map("salon_id") @db.Uuid
+  userId    String?  @map("user_id") @db.Uuid    // Optional: link to a User account
+  name      String   @db.VarChar(100)
+  title     String?  @db.VarChar(100)            // "Senior Stylist", "Master Barber"
+  photoUrl  String?  @map("photo_url") @db.Text
+  rating    Decimal  @default(0) @db.Decimal(3, 2)
+  isActive  Boolean  @default(true) @map("is_active")
+  isOnline  Boolean  @default(false) @map("is_online") // Real-time availability
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  salon          Salon           @relation(fields: [salonId], references: [id], onDelete: Cascade)
+  user           User?           @relation("BarberUser", fields: [userId], references: [id], onDelete: SetNull)
+  barberServices BarberService[]
+  bookings       Booking[]
+
+  @@index([salonId, isActive])
+  @@index([salonId, isOnline])
+  @@index([userId])
+  @@map("barbers")
+}
+
+// ============================================================
+// BARBER ↔ SERVICE JUNCTION (Many-to-Many)
+// ============================================================
+
+model BarberService {
+  barberId  String @map("barber_id") @db.Uuid
+  serviceId String @map("service_id") @db.Uuid
+
+  // Relations
+  barber  Barber  @relation(fields: [barberId], references: [id], onDelete: Cascade)
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@id([barberId, serviceId])
+  @@index([serviceId]) // Lookup: which barbers offer this service?
+  @@map("barber_services")
+}
+
+// ============================================================
+// BOOKINGS
+// ============================================================
+
+model Booking {
+  id              String        @id @default(uuid()) @db.Uuid
+  salonId         String        @map("salon_id") @db.Uuid
+  customerId      String?       @map("customer_id") @db.Uuid
+  barberId        String?       @map("barber_id") @db.Uuid
+  serviceId       String?       @map("service_id") @db.Uuid
+
+  // Denormalized customer info (captured at booking time, survives user deletion)
+  customerName    String?       @map("customer_name") @db.VarChar(100)
+  customerPhone   String?       @map("customer_phone") @db.VarChar(20)
+
+  // Denormalized service info (captured at booking time, survives service edits)
+  serviceName     String?       @map("service_name") @db.VarChar(150)
+  servicePrice    Decimal?      @map("service_price") @db.Decimal(10, 2)
+
+  appointmentAt   DateTime      @map("appointment_at") @db.Timestamptz(6)
+  durationMins    Int           @map("duration_mins")
+  price           Decimal       @db.Decimal(10, 2)
+  status          BookingStatus @default(pending)
+  type            BookingType   @default(appointment)
+  notes           String?       @db.Text
+
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  // Relations
+  salon       Salon       @relation(fields: [salonId], references: [id], onDelete: Cascade)
+  customer    User?       @relation("CustomerBookings", fields: [customerId], references: [id], onDelete: SetNull)
+  barber      Barber?     @relation(fields: [barberId], references: [id], onDelete: SetNull)
+  service     Service?    @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  queueEntry  QueueEntry?
+
+  @@index([salonId, appointmentAt])        // Primary query: today's schedule
+  @@index([salonId, status])              // Filter by status tab
+  @@index([customerId])                   // Customer's booking history
+  @@index([barberId, appointmentAt])      // Barber's schedule
+  @@index([customerPhone])               // Staff lookup by phone (walk-ins)
+  @@map("bookings")
+}
+
+// ============================================================
+// QUEUE
+// ============================================================
+
+model QueueEntry {
+  id            String    @id @default(uuid()) @db.Uuid
+  salonId       String    @map("salon_id") @db.Uuid
+  bookingId     String    @unique @map("booking_id") @db.Uuid // 1-to-1 with booking
+  position      Int                                           // Queue position (1 = next up)
+  estimatedWait Int?      @map("estimated_wait")             // Minutes, recalculated on mutations
+  checkedIn     Boolean   @default(false) @map("checked_in")
+  joinedAt      DateTime  @default(now()) @map("joined_at")
+  servedAt      DateTime? @map("served_at")
+
+  // Relations
+  salon   Salon   @relation(fields: [salonId], references: [id], onDelete: Cascade)
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@unique([salonId, position])    // No two customers at same position in same salon
+  @@index([salonId, position])     // Primary query: ordered queue list
+  @@index([salonId, checkedIn])    // Filter checked-in customers
+  @@map("queue_entries")
+}
